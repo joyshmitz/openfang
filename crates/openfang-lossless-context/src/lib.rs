@@ -2,9 +2,11 @@
 //!
 //! Lossless conversation context management for the OpenFang Agent OS.
 //!
-//! Inspired by the `@martian-engineering/lossless-claw` plugin for OpenClaw,
-//! this crate replaces the brute-force context-window overflow trimming with a
-//! DAG-based compression system:
+//! Inspired by the Lossless Context Management concept:
+//! - Paper: <https://papers.voltropy.com/LCM>
+//!
+//! This crate is a clean-room Rust implementation (no code copied) that adds
+//! DAG-based compression to the existing context-overflow pipeline:
 //!
 //! - **Leaf nodes** store original messages verbatim (the agent never loses data).
 //! - **Summary nodes** store LLM-generated summaries of compressed message groups.
@@ -44,8 +46,26 @@ pub mod integration;
 pub mod store;
 pub mod tools;
 
-pub use compressor::{LcmCompressor, LcmSummarizer};
+pub use compressor::{
+    extract_text, format_lcm_summary, parse_lcm_marker, CompressResult, LcmCompressor,
+    LcmSummarizer,
+};
 pub use dag::{DagNode, NodeType};
 pub use integration::{LcmOverflowResult, LosslessContextManager};
 pub use store::LcmStore;
 pub use tools::{dispatch_lcm_tool, is_lcm_tool, lcm_tool_definitions};
+
+/// Truncate a string at a safe UTF-8 char boundary.
+///
+/// Returns a prefix of `s` no longer than `max_bytes`, guaranteed to end on
+/// a valid character boundary (never panics on multi-byte UTF-8).
+pub fn safe_truncate(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}

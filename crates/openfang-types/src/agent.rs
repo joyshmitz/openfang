@@ -481,6 +481,18 @@ pub struct AgentManifest {
     /// Whether to generate workspace identity files (SOUL.md, USER.md, etc.) on creation.
     #[serde(default = "default_true")]
     pub generate_identity_files: bool,
+    /// Context-management strategy for this agent.
+    ///
+    /// Controls how the agent handles context-window overflow.
+    /// Default: `"lcm"` (lossless context management).
+    /// Set to `"none"` to disable context plugins entirely.
+    ///
+    /// ```toml
+    /// [context]
+    /// strategy = "lcm"     # "lcm" | "none"
+    /// ```
+    #[serde(default)]
+    pub context: ContextConfig,
     /// Per-agent exec policy override. If None, uses global exec_policy.
     /// Accepts string shorthand ("allow", "deny", "full", "allowlist") or full table.
     #[serde(default, deserialize_with = "crate::serde_compat::exec_policy_lenient")]
@@ -522,9 +534,26 @@ impl Default for AgentManifest {
             pinned_model: None,
             workspace: None,
             generate_identity_files: true,
+            context: ContextConfig::default(),
             exec_policy: None,
             tool_allowlist: Vec::new(),
             tool_blocklist: Vec::new(),
+        }
+    }
+}
+
+/// Context-management configuration for an agent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ContextConfig {
+    /// Which context strategy to use: `"lcm"` or `"none"`.
+    pub strategy: String,
+}
+
+impl Default for ContextConfig {
+    fn default() -> Self {
+        Self {
+            strategy: "lcm".to_string(),
         }
     }
 }
@@ -779,6 +808,7 @@ mod tests {
             pinned_model: None,
             workspace: None,
             generate_identity_files: true,
+            context: ContextConfig::default(),
             exec_policy: None,
             tool_allowlist: Vec::new(),
             tool_blocklist: Vec::new(),

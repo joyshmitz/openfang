@@ -179,6 +179,7 @@ impl SetupWizard {
             generate_identity_files: true,
             profile: None,
             fallback_models: vec![],
+            context: openfang_types::agent::ContextConfig::default(),
             exec_policy: None,
             tool_allowlist: vec![],
             tool_blocklist: vec![],

@@ -359,6 +359,7 @@ mod tests {
                 pinned_model: None,
                 workspace: None,
                 generate_identity_files: true,
+                context: openfang_types::agent::ContextConfig::default(),
                 exec_policy: None,
                 tool_allowlist: vec![],
                 tool_blocklist: vec![],

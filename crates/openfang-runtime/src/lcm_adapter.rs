@@ -3,8 +3,8 @@
 //! Provides:
 //! - [`LlmBasedSummarizer`] — implements [`LcmSummarizer`] using the agent's
 //!   current LLM driver so summaries are generated with the same model.
-//! - [`create_lcm_session`] — factory used by `run_agent_loop` to build a
-//!   per-session [`LosslessContextManager`].
+//! - [`build_context_plugins`] — single entry point used by the agent loop to
+//!   construct all context-management plugins for a session.
 //!
 //! # Design
 //!
@@ -12,15 +12,20 @@
 //! dependency on `openfang-runtime` (avoids a circular crate dependency).
 //! This module, living in the runtime, provides the concrete implementation
 //! that wires the two crates together.
+//!
+//! The agent loop knows nothing about LCM — it only sees
+//! `Vec<Box<dyn ContextPlugin>>` returned by [`build_context_plugins`].
 
+use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use openfang_lossless_context::{LcmSummarizer, LosslessContextManager};
+use openfang_types::context_plugin::ContextPlugin;
 use openfang_types::message::{Message, MessageContent, Role};
 
 use crate::llm_driver::{CompletionRequest, LlmDriver};
-use openfang_types::message::ContentBlock;
+use openfang_lossless_context::safe_truncate;
 
 // ---------------------------------------------------------------------------
 // LlmBasedSummarizer
@@ -61,8 +66,8 @@ impl LcmSummarizer for LlmBasedSummarizer {
                     Role::Assistant => "Assistant",
                     Role::System => "System",
                 };
-                let text = msg_to_text(m);
-                let snippet = &text[..800.min(text.len())];
+                let text = openfang_lossless_context::extract_text(&m.content);
+                let snippet = safe_truncate(&text, 800);
                 format!("[{i}] {role}: {snippet}")
             })
             .collect::<Vec<_>>()
@@ -92,25 +97,6 @@ impl LcmSummarizer for LlmBasedSummarizer {
 }
 
 // ---------------------------------------------------------------------------
-// Text extraction helper
-// ---------------------------------------------------------------------------
-
-fn msg_to_text(msg: &Message) -> String {
-    match &msg.content {
-        MessageContent::Text(t) => t.clone(),
-        MessageContent::Blocks(blocks) => blocks
-            .iter()
-            .filter_map(|b| match b {
-                ContentBlock::Text { text, .. } => Some(text.as_str()),
-                ContentBlock::ToolResult { content, .. } => Some(content.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Factory
 // ---------------------------------------------------------------------------
 
@@ -124,9 +110,10 @@ fn msg_to_text(msg: &Message) -> String {
 pub fn create_lcm_session(
     driver: Arc<dyn LlmDriver>,
     model: &str,
+    session_id: &str,
 ) -> Option<LosslessContextManager> {
     let summarizer = Box::new(LlmBasedSummarizer::new(driver, model));
-    match LosslessContextManager::new_in_memory(summarizer) {
+    match LosslessContextManager::new_in_memory(summarizer, session_id) {
         Ok(mgr) => Some(mgr),
         Err(e) => {
             tracing::warn!("Failed to initialise LCM session: {e}");
@@ -162,11 +149,45 @@ pub fn create_lcm_session_on_disk(
         }
     };
     let summarizer = Box::new(LlmBasedSummarizer::new(driver, model));
-    match LosslessContextManager::new(&db_path_str, summarizer) {
+    match LosslessContextManager::new(&db_path_str, summarizer, session_id) {
         Ok(mgr) => Some(mgr),
         Err(e) => {
             tracing::warn!("Failed to initialise disk-backed LCM session at {db_path_str}: {e}");
             None
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Plugin builder (single entry point for the agent loop)
+// ---------------------------------------------------------------------------
+
+/// Build the context-management plugin stack for an agent session.
+///
+/// The agent loop calls this once at session start and receives an opaque
+/// `Vec<Box<dyn ContextPlugin>>`.  It never imports LCM types directly.
+///
+/// `strategy` comes from `manifest.context.strategy`:
+/// - `"lcm"` (default) — DAG-based lossless context management
+/// - `"none"` — no context plugins, lossy trim only
+pub fn build_context_plugins(
+    strategy: &str,
+    driver: Arc<dyn LlmDriver>,
+    model: &str,
+    session_id: &str,
+    data_dir: Option<&Path>,
+) -> Vec<Box<dyn ContextPlugin>> {
+    match strategy {
+        "none" => vec![],
+        _ => {
+            let lcm: Option<Box<dyn ContextPlugin>> = if let Some(dir) = data_dir {
+                create_lcm_session_on_disk(driver, model, dir, session_id)
+                    .map(|m| Box::new(m) as Box<dyn ContextPlugin>)
+            } else {
+                create_lcm_session(driver, model, session_id)
+                    .map(|m| Box::new(m) as Box<dyn ContextPlugin>)
+            };
+            lcm.into_iter().collect()
         }
     }
 }

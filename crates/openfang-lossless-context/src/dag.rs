@@ -38,10 +38,12 @@ pub struct DagNode {
     pub id: String,
     /// The session this node belongs to.
     pub session_id: String,
-    /// Parent summary node, if any.
+    /// Parent summary node, if any (set during multi-depth condensation).
     pub parent_id: Option<String>,
     /// Whether this is a leaf (original) or summary (compressed) node.
     pub node_type: NodeType,
+    /// Depth in the DAG: 0 = leaf, 1 = summary of leaves, 2+ = summary of summaries.
+    pub depth: u32,
     /// For Leaf: the original message role ("user" / "assistant" / "tool").
     /// For Summary: None.
     pub role: Option<String>,
@@ -73,6 +75,7 @@ impl DagNode {
             session_id: session_id.to_string(),
             parent_id: None,
             node_type: NodeType::Leaf,
+            depth: 0,
             role: Some(role.to_string()),
             content: content.to_string(),
             message_index: Some(message_index),
@@ -83,10 +86,13 @@ impl DagNode {
     }
 
     /// Create a summary node from child node IDs and an LLM-generated summary.
+    ///
+    /// `depth` is 1 for summaries of leaves, 2+ for summaries of summaries.
     pub fn new_summary(
         session_id: &str,
         summary: &str,
         children: Vec<String>,
+        depth: u32,
     ) -> Self {
         let token_estimate = (summary.len() as u64 / 4).max(1);
         Self {
@@ -94,6 +100,7 @@ impl DagNode {
             session_id: session_id.to_string(),
             parent_id: None,
             node_type: NodeType::Summary,
+            depth,
             role: None,
             content: summary.to_string(),
             message_index: None,
@@ -113,9 +120,54 @@ impl DagNode {
         self.node_type == NodeType::Summary
     }
 
-    /// A short preview of the content (first 80 chars).
+    /// A short preview of the content (first ~80 bytes, truncated at char boundary).
     pub fn preview(&self) -> &str {
-        let end = self.content.len().min(80);
-        &self.content[..end]
+        crate::safe_truncate(&self.content, 80)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preview_ascii() {
+        let node = DagNode::new_leaf("s", "user", "short text", 0);
+        assert_eq!(node.preview(), "short text");
+    }
+
+    #[test]
+    fn preview_truncates_at_char_boundary() {
+        // 50 Cyrillic chars × 2 bytes = 100 bytes, exceeds 80-byte limit
+        let text = "Б".repeat(50);
+        let node = DagNode::new_leaf("s", "user", &text, 0);
+        let preview = node.preview();
+        // Must be valid UTF-8 (no panic) and ≤ 80 bytes
+        assert!(preview.len() <= 80);
+        assert!(preview.is_char_boundary(preview.len()));
+        // Should contain exactly 40 'Б' chars (40 × 2 = 80 bytes)
+        assert_eq!(preview.chars().count(), 40);
+    }
+
+    #[test]
+    fn preview_emoji() {
+        // Emoji are 4 bytes each: 21 emojis = 84 bytes > 80
+        let text = "🔥".repeat(21);
+        let node = DagNode::new_leaf("s", "user", &text, 0);
+        let preview = node.preview();
+        assert!(preview.len() <= 80);
+        // 80 / 4 = 20 whole emojis
+        assert_eq!(preview.chars().count(), 20);
+    }
+
+    #[test]
+    fn safe_truncate_edge_cases() {
+        assert_eq!(crate::safe_truncate("", 10), "");
+        assert_eq!(crate::safe_truncate("abc", 10), "abc");
+        assert_eq!(crate::safe_truncate("abc", 3), "abc");
+        assert_eq!(crate::safe_truncate("abc", 2), "ab");
+        // Multi-byte: 'é' is 2 bytes, truncating at byte 1 should give empty
+        assert_eq!(crate::safe_truncate("é", 1), "");
+        assert_eq!(crate::safe_truncate("é", 2), "é");
     }
 }
