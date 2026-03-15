@@ -26,6 +26,7 @@ pub mod hooks;
 pub mod host_functions;
 pub mod image_gen;
 pub mod kernel_handle;
+pub mod lcm_adapter;
 pub mod link_understanding;
 pub mod llm_driver;
 pub mod llm_errors;

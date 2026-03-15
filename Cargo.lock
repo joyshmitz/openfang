@@ -3999,6 +3999,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "openfang-lossless-context"
+version = "0.4.4"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "openfang-types",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-test",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "openfang-memory"
 version = "0.4.4"
 dependencies = [
@@ -4048,6 +4066,7 @@ dependencies = [
  "dashmap",
  "futures",
  "hex",
+ "openfang-lossless-context",
  "openfang-memory",
  "openfang-skills",
  "openfang-types",

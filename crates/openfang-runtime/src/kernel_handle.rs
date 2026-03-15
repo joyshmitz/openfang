@@ -250,4 +250,13 @@ pub trait KernelHandle: Send + Sync {
         let _ = parent_caps;
         self.spawn_agent(manifest_toml, parent_id).await
     }
+
+    /// Return the kernel's data directory for per-session storage.
+    ///
+    /// Used by the agent loop to store LCM SQLite databases at
+    /// `<data_dir>/lcm/<session_id>.db`. Returns `None` in test/embedded
+    /// contexts where no kernel is wired in.
+    fn data_dir(&self) -> Option<std::path::PathBuf> {
+        None
+    }
 }

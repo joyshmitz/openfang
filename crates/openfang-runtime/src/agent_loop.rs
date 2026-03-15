@@ -8,6 +8,7 @@ use crate::context_budget::{apply_context_guard, truncate_tool_result_dynamic, C
 use crate::context_overflow::{recover_from_overflow, RecoveryStage};
 use crate::embedding::EmbeddingDriver;
 use crate::kernel_handle::KernelHandle;
+use crate::lcm_adapter;
 use crate::llm_driver::{CompletionRequest, LlmDriver, LlmError, StreamEvent};
 use crate::llm_errors;
 use crate::loop_guard::{LoopGuard, LoopGuardConfig, LoopGuardVerdict};
@@ -295,8 +296,51 @@ pub async fn run_agent_loop(
     let context_budget = ContextBudget::new(ctx_window);
     let mut any_tools_executed = false;
 
+    // Lossless context manager: preserves compressed messages as searchable DAG nodes.
+    // Prefers disk-backed SQLite (survives daemon restarts) when the kernel exposes its
+    // data directory; falls back to in-memory for tests / embedded contexts.
+    let lcm_session = {
+        let session_id_str = session.id.to_string();
+        if let Some(data_dir) = kernel.as_ref().and_then(|k| k.data_dir()) {
+            lcm_adapter::create_lcm_session_on_disk(
+                Arc::clone(&driver),
+                &manifest.model.model,
+                &data_dir,
+                &session_id_str,
+            )
+        } else {
+            lcm_adapter::create_lcm_session(Arc::clone(&driver), &manifest.model.model)
+        }
+    };
+
+    // Extend available_tools with the three LCM tools (lcm_grep, lcm_describe, lcm_expand)
+    // so the LLM knows it can search compressed history at any time.
+    let mut lcm_extended_tools: Vec<ToolDefinition> = available_tools.to_vec();
+    if let Some(ref lcm) = lcm_session {
+        lcm_extended_tools.extend(lcm.tool_definitions());
+    }
+    let available_tools: &[ToolDefinition] = &lcm_extended_tools;
+
     for iteration in 0..max_iterations {
         debug!(iteration, "Agent loop iteration");
+
+        // Lossless overflow recovery: compress oldest messages into a DAG summary node
+        // before falling through to the lossy stage-1/stage-2 trimming pipeline.
+        // Only triggered when context is genuinely near the limit (>70% full) to avoid
+        // consuming LLM calls on short conversations.
+        if let Some(ref lcm) = lcm_session {
+            let est = crate::compactor::estimate_token_count(
+                &messages,
+                Some(&system_prompt),
+                Some(available_tools),
+            );
+            if est > (ctx_window as f64 * 0.70) as usize {
+                let session_id = session.id.to_string();
+                let _ = lcm
+                    .recover_overflow(&session_id, &mut messages, 10)
+                    .await;
+            }
+        }
 
         // Context overflow recovery pipeline (replaces emergency_trim_messages)
         let recovery =
@@ -601,6 +645,23 @@ pub async fn run_agent_loop(
                     }
 
                     debug!(tool = %tool_call.name, id = %tool_call.id, "Executing tool");
+
+                    // LCM tool intercept: lcm_grep / lcm_describe / lcm_expand are handled
+                    // synchronously by the LosslessContextManager — no external I/O needed.
+                    if let Some(ref lcm) = lcm_session {
+                        if lcm.owns_tool(&tool_call.name) {
+                            let content =
+                                lcm.handle_tool_call(&tool_call.name, &tool_call.input);
+                            tool_result_blocks.push(ContentBlock::ToolResult {
+                                tool_use_id: tool_call.id.clone(),
+                                tool_name: tool_call.name.clone(),
+                                content,
+                                is_error: false,
+                            });
+                            any_tools_executed = true;
+                            continue;
+                        }
+                    }
 
                     // Notify phase: ToolUse
                     if let Some(cb) = on_phase {
@@ -1256,8 +1317,46 @@ pub async fn run_agent_loop_streaming(
     let context_budget = ContextBudget::new(ctx_window);
     let mut any_tools_executed = false;
 
+    // Lossless context manager (streaming path) — mirrors run_agent_loop wiring.
+    let lcm_session_stream = {
+        let session_id_str = session.id.to_string();
+        if let Some(data_dir) = kernel.as_ref().and_then(|k| k.data_dir()) {
+            lcm_adapter::create_lcm_session_on_disk(
+                Arc::clone(&driver),
+                &manifest.model.model,
+                &data_dir,
+                &session_id_str,
+            )
+        } else {
+            lcm_adapter::create_lcm_session(Arc::clone(&driver), &manifest.model.model)
+        }
+    };
+
+    // Extend available_tools with LCM tool definitions for the streaming path.
+    let mut lcm_extended_tools_stream: Vec<ToolDefinition> = available_tools.to_vec();
+    if let Some(ref lcm) = lcm_session_stream {
+        lcm_extended_tools_stream.extend(lcm.tool_definitions());
+    }
+    let available_tools: &[ToolDefinition] = &lcm_extended_tools_stream;
+
     for iteration in 0..max_iterations {
         debug!(iteration, "Streaming agent loop iteration");
+
+        // Lossless overflow recovery (streaming path) — run before lossy pipeline.
+        // Only triggered when context is genuinely near the limit (>70% full).
+        if let Some(ref lcm) = lcm_session_stream {
+            let est = crate::compactor::estimate_token_count(
+                &messages,
+                Some(&system_prompt),
+                Some(available_tools),
+            );
+            if est > (ctx_window as f64 * 0.70) as usize {
+                let session_id_for_lcm = session.id.to_string();
+                let _ = lcm
+                    .recover_overflow(&session_id_for_lcm, &mut messages, 10)
+                    .await;
+            }
+        }
 
         // Context overflow recovery pipeline (replaces emergency_trim_messages)
         let recovery =
@@ -1618,6 +1717,25 @@ pub async fn run_agent_loop_streaming(
 
                     // Resolve effective exec policy (per-agent override or global)
                     let effective_exec_policy = manifest.exec_policy.as_ref();
+
+                    // Intercept LCM tool calls (streaming path) — handled synchronously,
+                    // no need for timeout-wrapping or tool_runner dispatch.
+                    if lcm_session_stream
+                        .as_ref()
+                        .map(|l| l.owns_tool(&tool_call.name))
+                        .unwrap_or(false)
+                    {
+                        let lcm = lcm_session_stream.as_ref().unwrap();
+                        let content = lcm.handle_tool_call(&tool_call.name, &tool_call.input);
+                        tool_result_blocks.push(ContentBlock::ToolResult {
+                            tool_use_id: tool_call.id.clone(),
+                            tool_name: tool_call.name.clone(),
+                            content,
+                            is_error: false,
+                        });
+                        any_tools_executed = true;
+                        continue;
+                    }
 
                     // Timeout-wrapped execution
                     let result = match tokio::time::timeout(
